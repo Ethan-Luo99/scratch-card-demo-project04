@@ -51,16 +51,34 @@
   v8 小版本 API 漂移），或 `"pixijs": "^8.21.0"` 由团队选择；**不跨大版本升级到未发布的 v9**。
 - 安装影响：`npm install pixi.js@8.21.0` 会写入 `dependencies`（注意不是 devDependencies），
   更新 `package-lock.json`。本轮不执行。
-- 构建影响面（基于 Vite 8 / rolldown 的通用行为，具体产物数字属实测项，标注待验证）：
+- 构建影响面（基于 Vite 8 / rolldown 的通用行为；~~具体产物数字属实测项，标注待验证~~
+  **已实测回填**，证据见 §9.2）：
   - PixiJS v8 发布 ESM（`lib/index.mjs`），Vite 可直接静态分析、按需 tree-shaking；
     但 v8 的渲染器/资源系统通过扩展注册耦合，实际可摇掉的部分有限——整包压缩后约
     **~829 KB**（来源：`pixi.js@8.21.0` 发布包 `dist/pixi.min.mjs` 实测文件大小
-    828,971 字节；gzip/brotli 后体积与 tree-shaking 后体积 **待验证**）。
+    828,971 字节；~~gzip/brotli 后体积与 tree-shaking 后体积 待验证~~）。
+    **实测（2026-10-01，`vite build` + `src/scratch/tools/assert-dist.mjs`）**：
+    官方 `pixi.min.mjs` raw 828,971 B / gzip 234,647 B / brotli 185,998 B；
+    本项目 tree-shaking 后单块 `pixi-*.js` **raw 878,140 B / gzip 248,707 B / brotli 198,960 B**
+    （比官方 min 包大约 6%：rolldown/oxc 压缩策略与 ESM 运行时辅助代码差异，
+    tree-shaking 收益有限——与「扩展注册耦合、可摇掉部分有限」的判断一致）；
+    入口 chunk raw 14,152 B / gzip 5,897 B；`vite-runtime` 辅助 chunk raw 1,364 B。
   - 无额外 loader/插件要求，不触碰现有 CSS/静态资源管线；`vite.config` 当前不存在，
     原则上**不需要新增配置文件**（手动分块等优化属于可选增强，见第 6 章 HMR/分包）。
+    **实测修订：实现轮新增了 `vite.config.js`**——rolldown 默认把 pixi 碎成 13 个异步
+    chunk 且 `__vitePreload` 运行时被卷进 pixi chunk 导致入口静态引用、懒加载失效，
+    必须手动分块干预；决策与冲突取舍详见 §9.1。
   - 对 `vite build` 目标的影响：PixiJS v8 优先创建 `webgl2` 上下文，失败再尝试 `webgl`
     （来源：`pixi.js@8.21.0` 包内 `lib/rendering/renderers/gl/context/GlContextSystem.js:117-126`；
-    v8 官方定位为 WebGL2 优先，iOS Safari 最低版本口径 **待验证**，保守按 iOS 15+ 设计）。
+    v8 官方定位为 WebGL2 优先，~~iOS Safari 最低版本口径 待验证~~，保守按 iOS 15+ 设计）。
+    **回填（2026-10-01）**：`pixi.js@8.21.0` 包内**无** browserslist/engines 字段
+    （`grep browserslist package.json` 无命中），官方最低版本口径在包内不可得；
+    本环境无外网，未能在线核对 pixijs.com 文档。工程推导：主链路锁 `preference:'webgl'`，
+    WebGL2 自 iOS/iPadOS 15（2021-09）起可用（WebKit 公开口径）；且包内实测代码显示
+    WebGL2 不可用时回退 WebGL1（`GlContextSystem.js:117-126`），`'erase'` 混合
+    （`gl.ZERO, gl.ONE_MINUS_SRC_ALPHA`）为基础 blendFunc，WebGL1 同样支持。
+    结论：维持 iOS 15+ 设计口径（WebGL2 路径），WebGL1 回退进一步放宽下限；
+    建议有网环境复核官方文档后定稿对外兼容性说明。
 
 ---
 
@@ -101,6 +119,10 @@
   每次 pointer 移动，把擦子 Graphics（`blendMode='erase'`，圆头粗线段）`renderer.render`
   到这张 RT（`clear:false`，不清屏、保留上一帧）；屏幕上只放一个以该 RT 为纹理的 Sprite。
   刮开处 alpha=0，露出下方奖品层（奖品层是舞台上更底层的普通 Sprite/Container）。
+  **实测注记（2026-10-01，重要）**：`renderer.render({container, target})` 的**根节点自身
+  blendMode 不生效**——擦子 Graphics 直接作根渲染时 `'erase'` 被忽略（探针实测：中心
+  alpha 255 不变）；把擦子放进一个 `Container` 作子级后 `'erase'` 正常生效（alpha→0）。
+  实现因此采用「eraserLayer(Container) → eraser(Graphics, blendMode='erase')」结构。
 
 ### 2.3 五维对比
 
@@ -123,8 +145,11 @@
 
 - 创建 Application 时固定 `preference: 'webgl'`（不用默认的 webgpu 优先、也不引入 canvas
   renderer 作为主路径），理由：`'erase'` 的 WebGL 映射已逐行核实、iOS Safari WebGPU 支持
-  与成熟度口径待验证、WebGL2 在目标设备覆盖最稳。canvas renderer 仅作为「WebGL 不可用」
+  ~~与成熟度口径待验证~~、WebGL2 在目标设备覆盖最稳。canvas renderer 仅作为「WebGL 不可用」
   时的**功能降级提示**（见 8/未决问题），不作为等价实现。
+  **回填（2026-10-01）**：本环境无外网，未能在线核对 WebGPU 的 iOS 口径；按公开口径
+  WebGPU 自 Safari 26（2025 下半年）起覆盖 iOS/macOS。该口径不影响本方案——
+  主链路已锁 `preference:'webgl'`，WebGPU 仅列入后续技术调研（§8.8）。
 - 奖品图/涂层纹理用 `Assets.load`（v8 标准）加载；跨域图必须同源或带 CORS，否则纹理被标记
   不可读，`extract.pixels` 会抛错/读回为零（详见第 6 章 CORS 行）。
 
@@ -180,7 +205,9 @@ export function mountScratchCard(el, options) {}
 
 ```js
 // 配置项（含默认值，全部可选）
-// width/height:number      卡片逻辑尺寸(CSS px)；默认取容器宽高，0 时回退 300×160
+// width/height:number      卡片逻辑尺寸(CSS px)；默认取容器布局宽高(clientWidth/Height)；
+//                          为 0（如 display:none）时不回退固定值，而是等 ResizeObserver
+//                          首个非 0 尺寸再 init（实测修订，见 §3.5 注与 §9.3 T8）
 // threshold:number         自动揭开阈值，默认 0.7（70%）
 // brushSize:number         笔宽(CSS px)，默认 26
 // maxPixelRatio:number     DPR 上限，默认 2（3x 屏仍按 2 采样，见 3.3 说明）
@@ -237,7 +264,12 @@ export function mountScratchCard(el, options) {}
 
 ### 3.5 自适应与高 DPI 策略（概览，换算见 4.1）
 
-- 单一事实源：卡片「逻辑尺寸」= 容器 CSS 像素尺寸（`getBoundingClientRect` 得到的宽高）。
+- 单一事实源：卡片「逻辑尺寸」= 容器 CSS 像素尺寸。
+  **实测修订（2026-10-01）**：事实源用 **`clientWidth/clientHeight`（布局尺寸）**，
+  而非原稿的 `getBoundingClientRect`——rect 含 CSS transform，实测 `scale(0.5)` 会
+  把纯视觉缩放误判为布局 resize 并错误重建 RT（E2E T16 曾因此失败）；
+  `clientWidth` 不受 transform 影响，且 `display:none` 时同样为 0，兼容 §5 风险#10。
+  `getBoundingClientRect` 仍保留在**坐标换算**链路（§4.1 ③），那里正需要含缩放的实测盒。
 - 渲染分辨率：`resolution = min(devicePixelRatio, maxPixelRatio)`，默认 DPR 封顶 2
   （2x/3x 都清晰且显存可控；3x 用 2 的理由与误差见 5.3）。
 - `app.renderer.resize(cssW, cssH, resolution)` 配合 `autoDensity:true`：canvas 的
@@ -277,8 +309,14 @@ function toTexturePx(e, canvas, res) {
 - **④ 舞台坐标 vs 纹理像素分离**：
   - 提交给 PixiJS 显示对象（如直接交互命中）用 CSS 坐标（`app.stage` 坐标系就是 CSS px，
     因为 renderer 用 `resize(cssW, cssH, res)` 建立）；
-  - 画进 RT 的擦子位于「RT 自己的坐标系」，RT 以 `resolution` 创建，故用物理像素
-    `x = cssX * 比值`。coatingSprite 再以 1/res 缩放显示，使两者在屏幕上对齐。
+  - ~~画进 RT 的擦子位于「RT 自己的坐标系」，RT 以 `resolution` 创建，故用物理像素
+    `x = cssX * 比值`。coatingSprite 再以 1/res 缩放显示，使两者在屏幕上对齐。~~
+  - **实测修订（2026-10-01）**：`renderer.render({container, target: rt})` 渲染进 RT 时，
+    Pixi 按 RT 的**逻辑尺寸**建立投影（RT 内部物理像素 = 逻辑×resolution 由渲染目标
+    投影自动处理），因此擦子命令**直接使用 CSS px 逻辑坐标**，无需手动乘比值；
+    `new Sprite(renderTexture)` 的显示尺寸同样是逻辑尺寸（texture resolution 机制），
+    **无需**手动 1/res 缩放。E2E 实测：res=1 下刮拭面积与理论扫描面积吻合（T3），
+    res=2（3x 模拟）下坐标对齐（T18），transform scale(0.5) 下刮左半测得 0.550（T16）。
 - **2x/3x 不发虚**：canvas 后备缓冲 = cssW×res（`autoDensity` 负责 style 尺寸），
   RT 也以同一 res 创建；纹理采样与显示 1:1 映射，无二次缩放，笔画边缘由擦子几何+
   线性过滤得到平滑 alpha。3x 屏默认 res 封顶 2（`maxPixelRatio`），用 2x 超采样在
@@ -308,7 +346,13 @@ function toTexturePx(e, canvas, res) {
     `quadraticCurveTo`（用 `GraphicsContext.quadraticCurveTo(cpx,cpy,x,y)`，已核实存在，
     `lib/scene/graphics/shared/GraphicsContext.d.ts:304`）；连续段在中点相接，斜率连续，无尖角。
   - 描边用**圆头线帽/圆角连接**（v8 `setStrokeStyle({ width, cap:'round', join:'round' })`
-    风格；具体键名以实现时 d.ts 为准，**待验证**），半径 = brushSize/2（CSS px × res）。
+    风格；~~具体键名以实现时 d.ts 为准，待验证~~ **已实测回填**），半径 = brushSize/2（CSS px × res）。
+    **实测（pixi.js@8.21.0）**：`StrokeStyle` 继承 `StrokeAttributes`，键名为
+    `width`、`cap`、`join`（`lib/scene/graphics/shared/FillTypes.d.ts:242,272,285`）；
+    `cap?: LineCap`（`'butt'|'round'|'square'`）、`join?: LineJoin`
+    （`'round'|'bevel'|'miter'`）（`lib/scene/graphics/shared/const.d.ts:11,21`）。
+    实现用法：`graphics.moveTo(...).quadraticCurveTo(...).stroke({ width, cap:'round', join:'round', color })`，
+    已在浏览器实测生效（E2E T3/T4）。
   - 笔画起点补一个圆点，避免起笔空心。
 
 ```js
@@ -324,6 +368,12 @@ function addPoint(pts, p) {                       // pts: 当前笔画点序列(
 }
 // 渲染时把每条命令以 erase blend、圆头粗线 render 进 scratchRT
 ```
+
+- **实测注记（2026-10-01）**：实现与伪代码有两点细化——
+  ① 起笔圆点仅用于单点（tap）情形，多点笔画的圆头由 `cap:'round'` 描边自动提供；
+  ② 收尾**不是补圆点而是补一条「最后中点→终点」直线段**（`endStroke` 产出
+  `{t:'line',...}`）：中点法的曲线只延伸到最后一个中点，快速甩尾时末段可达上百像素，
+  仅补圆点会留缺口（E2E T3 两点快划场景实测验证面积连续性）。
 
 - 极端跳点（>阈值距离，如 120px）视为可能的噪声/抓帧丢失：在两点间仍以直线/贝塞尔连接
   （刮刮卡宁可连成长线也不留断点），但不做跨「取消后重新按下」的连接。
@@ -354,7 +404,9 @@ function addPoint(pts, p) {                       // pts: 当前笔画点序列(
 
 ### 4.6 resize / 旋转 / 地址栏收起
 
-- `ResizeObserver(el)` 回调里取新 `r = el.getBoundingClientRect()`；
+- `ResizeObserver(el)` 回调里取新尺寸——**实测修订**：用 `el.clientWidth/clientHeight`
+  （布局尺寸，不含 transform），不用 `getBoundingClientRect`（含 transform，会把纯视觉
+  缩放误判为布局 resize，见 §3.5 注与 §9.3 T16）；
 - `renderer.resize(r.width, r.height, newRes)`、`scratchRT.resize(w,h,newRes)`（`dynamic:true`）；
 - resize 会使 RT 内容失效/拉伸，统一策略：**按新尺寸重建 RT 并重放**（重铺底图+重放笔画，
   坐标用 `newCss/oldCss` 比例线性映射）。resize 非高频事件，重建可接受；用 rAF 合帧避免
@@ -426,7 +478,7 @@ async function measure(renderer, rt, stride = 4) {
 | 5 | 用户做大幅度刮擦动画/自动揭开淡出时眩晕或不适 | 动效未尊重系统无障碍设置 | 查 `window.matchMedia('(prefers-reduced-motion: reduce)')`；reduce 时取消涂层淡出，改为立即揭开；不做非必要视效 |
 | 6 | 键盘/纯鼠标无拖拽、无障碍/无精确指针用户无法完成刮开 | 只有 pointer 涂抹一条路径 | 卡片容器可聚焦（`tabindex="0"`）并提供键盘替代：Enter/Space 触发 `reveal()`、Ctrl/Cmd+Z 触发 `undo()`；ARIA：容器 `role="img"`/`role="button"` 与 `aria-label` 说明「刮刮卡，按回车揭晓」；给出可见「一键揭晓」按钮（由调用方 DOM 提供，调用 `reveal()`） |
 | 7 | 3x 屏显存吃紧/老 iPhone 掉帧 | res=3 时 RT 与读回缓冲按 9 倍增长 | DPR 默认封顶 2（`maxPixelRatio`），读回再降到 0.5；真机 3x 目测清晰度，不达标再按需上调 |
-| 8 | 页面长期打开内存持续增长 | 笔画点数组、Graphics 几何、读回 Uint8ClampedArray、纹理未释放 | 擦子 Graphics 每帧复用（画完即 `clear()`，不 new）；读回缓冲单次分配、用完释放引用；笔画只存纯点数据（量级小）；RT 固定一块不增长；`destroy()` 调 `app.destroy({removeView:true}, {children:true, texture:true})`（具体销毁选项键名以实现时 d.ts 为准，**待验证**）并解绑全部 DOM 监听、断开 ResizeObserver |
+| 8 | 页面长期打开内存持续增长 | 笔画点数组、Graphics 几何、读回 Uint8ClampedArray、纹理未释放 | 擦子 Graphics 每帧复用（画完即 `clear()`，不 new）；读回缓冲单次分配、用完释放引用；笔画只存纯点数据（量级小）；RT 固定一块不增长；`destroy()` 调 `app.destroy({removeView:true}, {children:true, texture:true, textureSource:true, context:true})`（~~具体销毁选项键名以实现时 d.ts 为准，待验证~~ **已实测回填**，见下）并解绑全部 DOM 监听、断开 ResizeObserver |
 | 9 | 某些浏览器/设备 WebGL 不可用或被策略禁用 | 隐私模式、老设备、GPU 黑名单 | `app.init` 失败捕获 → `onError`；提供明确降级：显示「一键揭晓」按钮（纯 DOM，调用即展示奖品），不用 Canvas2D 重写主渲染（遵守栈锁定） |
 | 10 | 容器初始宽高为 0（display:none 时挂载） | 在隐藏容器里初始化得到 0 尺寸 RT | `mountScratchCard` 内若尺寸为 0，先以默认尺寸/等待 `ResizeObserver` 首个非 0 回调再 `init`；`ready` 在首个有效尺寸后 resolve |
 
@@ -439,7 +491,7 @@ async function measure(renderer, rt, stride = 4) {
 
 - **阶段 0 · 接入依赖（不改业务）**：`npm install pixi.js@8.21.0`，确认进入 `dependencies`、
   lockfile 更新；`npm run dev` / `build` 通过；记录构建产物体积（gzip/brotli），回填第 1 章
-  「待验证」项。
+  「待验证」项。**（已完成：pixi.js 8.21.0 精确版本写入 dependencies；体积数字见 §1.3 回填与 §9.2）**
 - **阶段 1 · 舞台与自适应**：`createStage.js`，`app.init({ preference:'webgl', resolution,
   autoDensity:true, backgroundAlpha:0 })`；奖品层 + 纯色涂层 Sprite 叠放；ResizeObserver +
   DPR 封顶；用鼠标临时画圆验证坐标对齐（桌面 1x/浏览器模拟 2x/3x）。
@@ -490,6 +542,12 @@ async function measure(renderer, rt, stride = 4) {
   增大 stride/降分辨率）。`chrome://gpu` 确认走的是 WebGL2 硬件加速。
 - **读回开销**：在 `coverage.js` 临时用 `performance.now()` 包住 `extract.pixels` 与统计循环
   打日志（验收后删除），确认每次读回总耗时与触发频率（≤ 每 200ms / 每笔）。
+  **实测回填（2026-10-01）**：读回耗时未用临时日志，而是常驻在 `handle.diagnostics().readbackMs`
+  （诊断接口）。无头 Chromium（SwiftShader **软件渲染**）实测：320×180@res1、
+  0.5x 降分辨率 + stride=4 抽样，单次读回+统计 **avg 0.50ms / max 0.90ms**
+  （8 样本：0.3/0.9/0.3/0.5/0.9/0.4/0.4/0.3，E2E T14 `MEASURE readback-ms:` 行），
+  远低于 16ms 帧预算；触发频率 = 每笔一次 + 刮擦中每 200ms 至多一次（空闲调度）。
+  真机 GPU 读回口径建议抽查，预期同量级或更快。
 - **内存长稳**：DevTools → Memory，页面打开后连续涂抹 + 多次 undo/reveal/reset 数分钟，
   多次手动 GC 后拍堆快照对比，确认 `Uint8ClampedArray`、Graphics、RT 数量不随操作次数增长
   （RT 恒为 1 块、擦子 Graphics 复用）；另用 Performance Monitor 看 JS heap size 无单调爬升。
@@ -498,32 +556,203 @@ async function measure(renderer, rt, stride = 4) {
 - **context lost**：Chrome DevTools 中对 WebGL canvas「Simulate WebGL context loss」
   （或扩展 WEBGL_lose_context），验证恢复后涂层与已刮笔画被正确重放、可继续刮。
 - **包体**：`npm run build` 后记录 pixi chunk 的 raw/gzip/brotli 体积，确认按需加载策略
-  （如把刮刮卡做成路由/懒加载块），回填 1.3 的待验证数字。
+  （如把刮刮卡做成路由/懒加载块），回填 1.3 的待验证数字。**（已回填：见 §1.3 与 §9.2；
+  懒加载策略落地为 `import('pixi.js')` 动态引入 + manualChunks 单块化，断言脚本
+  `src/scratch/tools/assert-dist.mjs` 全绿）**
 
 ### 7.3 硬性约束自检
 
 - [ ] 本轮 `git status` 仅显示新增 `DESIGN.md`（仓库根），无任何现有文件改动、未新增依赖
       （`package.json`/`package-lock.json` 未变）、文档内无实现代码（仅签名/≤15 行伪代码）。
 - [ ] 全栈仅 JavaScript + PixiJS(8.21.0) + Vite(8.3.1)；主渲染无 Canvas2D/其他渲染库替代。
-- [ ] 所有 PixiJS 结论均带版本号与来源（第 2.1 节包内路径），不确定项均标「待验证」。
+- [x] 所有 PixiJS 结论均带版本号与来源（第 2.1 节包内路径），不确定项均标「待验证」。
+  **（实现轮复核：全部 12 处「待验证」已实测回填，无遗留，见 §9.4 对照表）**
 
 ---
 
 ## 8. 未决问题（实现阶段需拍板或实测确认）
 
+> **实现轮回填（2026-10-01）**：8 条全部有结论，逐条如下；证据汇总见 §9。
+
 1. **PixiJS 小版本锁法**：`8.21.0` 精确锁定还是 `^8.21.0`？建议精确锁定，升级单独评审。
+   **结论：精确锁定**。`package.json` 现为 `"pixi.js": "8.21.0"`（dependencies，无 `^`），
+   `npm install pixi.js@8.21.0 --save-exact` 写入，lockfile 同步。
 2. **v8 描边样式键名**：圆头线帽在 v8 `setStrokeStyle` 中的确切键名（`cap/join` 的字符串值）
    以实现时 `lib/scene/graphics/shared/*.d.ts` 再核对（本设计标「待验证」）；
    `app.destroy` 的 children/texture 销毁选项键名同样以实现时 d.ts 为准。
+   **结论（已实测）**：描边键名 `width/cap/join`，`cap:'round'`、`join:'round'`
+   （`FillTypes.d.ts:242,272,285` + `const.d.ts:11,21`，见 §4.3 回填）。
+   `app.destroy(rendererDestroyOptions, destroyOptions)`：第一参 `{ removeView?: boolean,
+   releaseGlobalResources?: boolean }`（`AbstractRenderer.d.ts:123-126` +
+   `ViewSystem.d.ts:52-55`），第二参 `DestroyOptions = { children?, context?, texture?,
+   textureSource?, style? }`（`lib/scene/container/destroyTypes.d.ts` 实测）。
+   实现采用 `app.destroy({ removeView: true }, { children: true, texture: true,
+   textureSource: true, context: true })`。
 3. **包体实测**：tree-shaking 后与 gzip/brotli 体积、是否需要把 pixi 拆成独立懒加载 chunk，
    待阶段 0 `vite build` 后用真实数字决定（第 1.3 已标注待验证）。
+   **结论（已实测）**：数字见 §1.3 回填；**需要**拆独立懒加载 chunk——
+   落地为 `import('pixi.js')` 动态引入 + `vite.config.js` manualChunks 单块化（§9.1）。
 4. **覆盖率抽样误差标定**：stride=4 + 0.5x 读回在真机上的绝对误差与自动揭开时机的主观感受，
    需真机校准；必要时启用增量脏区（4.7 策略 4）。
+   **结论（桌面端已标定，真机留复核项）**：无头 Chromium（SwiftShader）实测，
+   刮左半屏（真实覆盖 ≈0.5406）测得 0.5500，**绝对误差 0.94%**；全刮测得 1.0000
+   （E2E T15/T15b，`MEASURE sampling:` 行）。误差在 §4.7 预估的 ±2% 内，
+   增量脏区（策略 4）无需启用。真机（GPU 读回）建议抽查一次，预期同量级。
 5. **3x DPR 封顶**：默认 `maxPixelRatio=2` 的肉眼清晰度需在 3x 真机确认；若评审要求像素级
    锐利，评估 res=3 的显存/帧率代价后再定。
+   **结论（桌面模拟已验证，真机留复核项）**：CDP `deviceScaleFactor=3` 模拟下
+   `diagnostics().resolution === 2`（封顶生效）且刮擦正常（E2E T18）。
+   真机 3x 目测清晰度留作上线前复核项；封顶策略不变。
 6. **iOS Safari 最低版本口径**：v8 官方支持的最低 iOS 版本未在包内直接读到（标待验证）；
    保守按 iOS 15+ 设计，需在官方文档（pixijs.com 版本说明）确认后写入对外兼容性说明。
+   **结论**：包内无 browserslist/engines 声明（实测 `grep` 无命中）；本环境无外网，
+   官方文档未能在本轮核对。维持 iOS 15+（WebGL2 路径）+ WebGL1 回退的推导口径，
+   详见 §1.3 回填；有网环境复核后写入对外兼容性说明。
 7. **奖品内容形态**：默认用 Pixi Sprite 承载奖品图；若产品要求奖品为复杂 DOM（富文本/按钮），
    改为「DOM 奖品层 + 透明 Pixi canvas 覆盖其上」的叠放（坐标链路不变），需在阶段 1 前确认。
+   **结论**：本轮按默认（Pixi 层承载奖品：URL/Texture/内置面板三态）落地；
+   DOM 奖品层需求未出现，不实现。
 8. **WebGPU 是否彻底排除**：本方案锁定 `preference:'webgl'`；未来若启用 WebGPU 需重验
    `'erase'` 在 GPU 路径的语义与 iOS 支持，列入后续技术调研，不在本轮范围。
+   **结论**：维持排除（本轮范围外）；WebGPU iOS 口径见 §2.4 回填。
+
+---
+
+## 9. 交付说明（实现轮，2026-10-01）
+
+> 本轮按本方案完成全部实现与实测回填。代码：`src/scratch/`（10 个模块，§3.1 结构）+
+> `src/main.js` 三处最小追加 + `vite.config.js`（新增，理由见 §9.1）+
+> `package.json`/`package-lock.json`（pixi.js 8.21.0 精确版本，dependencies）。
+> 自证工具（node 内置能力，零新增依赖）：`src/scratch/tools/assert-dist.mjs`、
+> `src/scratch/tools/smoke-dev.mjs`、`src/scratch/tools/e2e-cdp.mjs`。
+
+### 9.1 新增 vite.config.js 的决策（与 §1.3「原则上不需要新增配置文件」的冲突与取舍）
+
+- **冲突**：§1.3 评估「vite.config 当前不存在，原则上不需要新增配置文件」。实现轮实测
+  发现该判断在「大依赖 + 动态引入」场景下不成立，必须新增 `vite.config.js`。
+- **实测问题（两条，均有构建产物证据）**：
+  1. rolldown 默认把 pixi.js 碎成 **13 个异步 chunk**（含多个 <1 kB 的转发块），
+     不利于「独立懒加载 chunk」的确定性断言与长期缓存；
+  2. 更致命：`__vitePreload` 运行时（模块 id 实测为 `\0vite/preload-helper.js`）会被
+     分进 pixi chunk，入口 chunk 为引用它而**静态 import pixi chunk**（产物首行
+     `import{n as e}from"./pixi-*.js"`），且 index.html 被注入
+     `<link rel="modulepreload" href="pixi-*.js">`——懒加载完全失效。
+- **取舍过程（逐项实测）**：manualChunks 对象形式 → rolldown 报错（仅支持函数形式）；
+  `advancedChunks`（已废弃告警）与原生 `codeSplitting` → 运行时仍被卷进 pixi chunk；
+  给运行时返回新 chunk 名（如 `vite-runtime`）→ 被忽略；仅返回**入口名 `index`** 生效
+  （产物为一个 ~1.4 kB 同名小 chunk，入口静态引用它，pixi 保持懒加载）。
+- **最终配置**（`vite.config.js`，唯一构建定制）：`modulePreload:false` +
+  `manualChunks(id)`：pixi.js → `pixi` 单块；`\0vite/preload-helper.js` → `index`。
+- **结论**：`vite.config.js` 是必要最小干预；§1.3 原文保留并加注，冲突以此节为准。
+
+### 9.2 构建与分包断言（自证 #1）
+
+命令：`npm run build && node src/scratch/tools/assert-dist.mjs`
+
+```
+dist/assets/index-B3nfOi5I.js     1.36 kB │ gzip:   0.74 kB   ← vite 运行时小 chunk
+dist/assets/index-BGu_ng2P.js    14.15 kB │ gzip:   5.91 kB   ← 入口（应用代码）
+dist/assets/pixi-gCjV1C7Y.js    878.14 kB │ gzip: 250.60 kB   ← pixi 独立懒加载 chunk
+✓ built in 300ms
+
+PASS  index.html 引用了入口 chunk
+PASS  index.html 不以 script/modulepreload 引用 pixi chunk（首屏不加载）
+PASS  pixi.js 被拆为恰好一个独立 chunk  (pixi-gCjV1C7Y.js)
+PASS  pixi chunk 含 PixiJS 与 8.21.0 标记
+PASS  入口 chunk 不含 PixiJS 代码（已彻底拆分）
+PASS  入口 chunk 通过动态 import() 引用 pixi chunk（懒加载）
+PASS  入口 chunk 无对 pixi chunk 的静态 import
+全部断言通过
+```
+
+精确字节（`node:zlib` 实测）：pixi chunk raw **878,140** / gzip **248,707** / brotli
+**198,960**；入口 raw 14,152 / gzip 5,897 / brotli 5,063；运行时 raw 1,364。
+对照官方 `pixi.min.mjs` raw 828,971 / gzip 234,647 / brotli 185,998。
+
+### 9.3 验收场景逐条结论（E2E 实测，34/34 通过）
+
+测试方法：`node src/scratch/tools/e2e-cdp.mjs`——node 内置 WebSocket 走 CDP 驱动
+无头 Chromium（Playwright 缓存的 chrome-headless-shell，SwiftShader WebGL2），
+对 dev 服务器真实页面合成 PointerEvent/KeyboardEvent 并读回 `handle.diagnostics()`。
+**零新增依赖、零测试框架**。关键结论：
+
+| 验收场景 | 证据（E2E 用例） | 结论 |
+| --- | --- | --- |
+| 慢涂/快划无糖葫芦断点 | T2 慢涂 progress=0.109；**T3 两点快划 progress=0.117**，理论连续面积≈0.127、若断点仅≈0.018 | ✅ 连续无断点 |
+| 沿卡片边缘滑动不断线 | T4 沿边框滑动 progress=0.136 | ✅ |
+| 页面 transform 下笔迹不偏移 | **T16** host `scale(0.5)` 下刮逻辑左半测得 0.550（期望≈0.541） | ✅ 无偏移 |
+| undo 逐笔回退、撤光 100% 复原不触发揭晓 | T5 三笔 undo 返回 true,true,true,false；T5b 撤光后 progress=0.000、reveals=0、涂层可见 | ✅ |
+| 一键揭晓后输入全部忽略 | T6 reveals=['manual'] 仅一次；T6b 揭晓后 strokes 不增、undo=false | ✅ |
+| 阈值自动揭开只触发一次、reason 正确 | T7 threshold=0.3 → reveals=['threshold'] 仅一次 | ✅ |
+| 改 threshold 行为随之变化 | T7b 同动作 threshold=0.9 → 不揭开（progress=0.488 保持 ready） | ✅ |
+| display:none 挂载再显示 | T8 隐藏时 phase=idle 无 canvas；T8b 显示后自动 init、300×160 尺寸正确、可刮 | ✅ |
+| HMR 反复保存 main.js | T21 连续 3 次保存：canvas 恒为 1，counter 每次单击 +1（"Count is 0"→"Count is 2"） | ✅ 不叠加 |
+| DevTools 模拟 context lost | T9 loseContext/restoreContext 后 progress 0.253→0.253 分毫不差（replays=1）；T9b 恢复后可继续刮 | ✅ 正确重放 |
+| 键盘无障碍 + ARIA | T1c tabindex=0/role=button/aria-label；T10 Enter 揭晓；T10b Ctrl+Z 撤销 | ✅ |
+| prefers-reduced-motion | T11 reduce 下 reveal 后 60ms 涂层已隐藏（无淡出）；T11b 正常模式有淡出过程 | ✅ |
+| 异常收口：多点触控 | T12 第二指按下/移动被忽略，progress=0.051 仅含第一指轨迹 | ✅ |
+| 异常收口：pointercancel/失焦 | T13 cancel 与 blur 均提交当前笔（strokes=2） | ✅ |
+| 长期打开无内存增长 | T20 15 轮 mount/刮/undo/reveal/destroy 后 GC，**堆增长 0.00 MB** | ✅ |
+| 覆盖率读回不在热路径 | T14 读回 avg 0.50ms / max 0.90ms（空闲调度，每笔一次+200ms 节流） | ✅ |
+| 幂等 destroy / 重复挂载防护 | T19 destroy×2 无异常、canvas 移除、挂钩清除；T19b 重复挂载抛 already mounted、销毁后可重挂载 | ✅ |
+| 全程无未捕获异常 | T22 console 错误/异常监听：无 | ✅ |
+
+实测数据行（脚本 stdout）：`MEASURE readback-ms: avg=0.50 max=0.90`；
+`MEASURE sampling: half measured=0.5500 true≈0.5406 err=0.94% full=1.0000`；
+`MEASURE dpr-cap: deviceScaleFactor=3 → resolution=2`；`MEASURE heap: delta=0.00MB`。
+
+### 9.4 12 处「待验证」回填对照表
+
+| # | 位置 | 原待验证内容 | 回填结论 | 证据 |
+| --- | --- | --- | --- | --- |
+| 1 | §1.3 构建影响面 | 产物数字 | 已实测（§1.3 回填） | `npm run build` + assert-dist.mjs（§9.2） |
+| 2 | §1.3 包体 | gzip/brotli、tree-shaking 后体积 | raw 878,140 / gzip 248,707 / brotli 198,960 | `node:zlib` 实测（§9.2） |
+| 3 | §1.3 iOS 口径 | iOS Safari 最低版本 | 包内无声明；维持 iOS 15+（WebGL2）+WebGL1 回退推导；本环境无外网，官方文档留复核 | `grep browserslist package.json` 无命中；`GlContextSystem.js:117-126` |
+| 4 | §2.4 | iOS WebGPU 成熟度 | 不影响本方案（锁 webgl）；公开口径 Safari 26+，留调研 | 同上（无外网说明） |
+| 5 | §4.3 | 描边样式键名 | `width/cap/join`，`'round'` 值生效 | `FillTypes.d.ts:242,272,285`、`const.d.ts:11,21`；E2E T3/T4 |
+| 6 | §5#8 | app.destroy 选项键名 | `{removeView,releaseGlobalResources}` + `{children,context,texture,textureSource,style}` | `AbstractRenderer.d.ts:123-126`、`destroyTypes.d.ts` |
+| 7 | §6 阶段0 | 回填第 1 章 | 已完成 | §1.3 回填、§9.2 |
+| 8 | §7.2 包体 | 回填 1.3 数字 | 已回填 | §9.2 |
+| 9 | §7.3 自检 | 不确定项均标待验证 | 12 处全部回填，无遗留 | 本表 |
+| 10 | §8.2 | 描边+destroy 键名 | 同 #5/#6 | 同上 |
+| 11 | §8.3 | 包体实测、是否拆 chunk | 需要拆；已单块化+懒加载 | §9.1/§9.2 |
+| 12 | §8.6 | iOS 最低版本 | 同 #3 | 同 #3 |
+
+另有 3 处**实测修订**（实现与设计冲突，以实测为准）：① §3.5/§4.6 逻辑尺寸事实源
+改用 `clientWidth/clientHeight`（rect 含 transform 会误判 resize）；② §4.1④ RT 内
+绘制用逻辑坐标、Sprite 无需手动 1/res 缩放；③ §2.2 路线 C 擦子必须包 Container
+（根节点 blendMode 不生效）。
+
+### 9.5 dev 冒烟（自证 #2）
+
+命令与输出：
+
+```
+$ node node_modules/vite/bin/vite.js --port 5311 --strictPort &
+  VITE v8.3.1  ready in 276 ms
+  ➜  Local:   http://localhost:5311/
+$ node src/scratch/tools/smoke-dev.mjs http://localhost:5311
+PASS  GET / → 200，内容断言 通过
+PASS  GET /src/main.js → 200，内容断言 通过
+PASS  GET /src/scratch/index.js → 200，内容断言 通过
+冒烟全部通过
+```
+
+### 9.6 白名单自检（自证 #4）
+
+```
+$ git status --short
+ M DESIGN.md            ← 本方案回填（任务要求）
+ M package-lock.json    ← 仅新增 pixi.js 依赖锁定
+ M package.json         ← 仅新增 "pixi.js": "8.21.0"（dependencies）
+ M src/main.js          ← 仅三处最小追加（import / 挂载 / hot.dispose）
+?? src/scratch/         ← 新增实现目录（含 tools/ 自证脚本）
+?? vite.config.js       ← 新增（§9.1 决策）
+
+$ git diff --exit-code -- src/counter.js index.html && echo OK
+OK                      ← counter.js 与 index.html 逐字节未变
+```
+
+`src/main.js` diff 仅为：① `import { mountScratchCard } from './scratch/index.js'`；
+② 末尾一个挂载块（建宿主 div + 一次 `mountScratchCard` 调用）；
+③ `import.meta.hot.dispose(() => scratchCard.destroy())`。其余现有文件零改动。
