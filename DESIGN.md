@@ -756,3 +756,98 @@ OK                      ← counter.js 与 index.html 逐字节未变
 `src/main.js` diff 仅为：① `import { mountScratchCard } from './scratch/index.js'`；
 ② 末尾一个挂载块（建宿主 div + 一次 `mountScratchCard` 调用）；
 ③ `import.meta.hot.dispose(() => scratchCard.destroy())`。其余现有文件零改动。
+
+---
+
+## 10. 多卡组架构选型（增强包，2026-10-06）
+
+### 10.1 决策：每卡独立 Application，不共享 stage
+
+`ScratchCardGroup`（`src/scratch/group.js`）内部直接复用 `mountScratchCard`，
+N 张卡 = N 个独立 `PIXI.Application` / N 个 canvas / N 个 WebGL 上下文。
+**放弃**「共享一个 Application、多卡同 stage」方案。三维度权衡：
+
+| 维度 | 共享 Application | 每卡独立 Application（选定） |
+| --- | --- | --- |
+| WebGL 上下文数量上限 | 1 个上下文，远离浏览器上限（Chrome 约 16 个/域，超限最旧上下文被强制丢失） | N 个上下文；N=3 演示场景安全，但 N 持续增大（运营页十几张卡）会逼近上限，是选定方案的天花板 |
+| 显存 | 共享 renderer 管理结构、共享 shader/程序缓存，每卡省一份固定开销 | 每卡一份 renderer + 程序缓存 + 自管 RT，固定开销 ×N；单卡 RT 本身（动态纹理）两边都要付，增量主要是 renderer 固定成本，量级可接受 |
+| 隔离性 | 单点故障面：一次 context lost 全组停摆；一卡 destroy 误传 `context:true` 会拆掉共享上下文殃及邻卡；共享 ticker/stage 使单卡异常（渲染抛错）可能中断整帧 | 故障域 = 单卡：context lost/restore、destroy、init 失败全部天然隔离，正好命中本轮「故障隔离」硬需求；代价是放弃上下文数与显存的规模优势 |
+
+**结论**：运营增强包的核心诉求是「单卡故障不波及邻卡」（需求 4），隔离性权重最高；
+N≥3 的典型运营位（3~6 张）离上下文上限很远，显存增量是固定小头。
+若未来出现「一页十几张卡」的需求，再评估共享 Application + 每卡独立
+RenderTexture/子舞台的改造（那时 context lost 需自行做全组重放编排）。
+
+### 10.2 group 的隔离实现要点
+
+- 同步挂载失败（非法容器、重复挂载）：`mountScratchCard` 抛错被逐槽位 try/catch
+  收口进 `failures`，循环继续，其余卡照常挂载。
+- 异步 init 失败（WebGL 不可用、奖品图跨域）：包装 `onError` + `ready.catch`
+  双保险标记槽位死亡，不向组外抛、不中断邻卡。
+- `destroy()`：逐卡调用且单卡异常被吞，保证「一张销不干净」不阻塞其余卡。
+- `aliveCount()`：实时口径 = 槽位存活标记 ∧ 卡片 `diagnostics().phase !== 'destroyed'`，
+  调用方直接 `card.destroy()` 也能被正确计数（destroy 已被包装打标）。
+
+## 11. 增强包实现说明（2026-10-06）
+
+### 11.1 reset()：revealed → ready
+
+- 入口守卫：仅 `phase === 'revealed'` 可复位，其余态返回 `false`（幂等、不误清进行中的刮擦）。
+- 复位动作：`epoch++` → 清空笔画栈（`clearHistory`）→ 摘除淡出 ticker →
+  `sprite.alpha = 1; sprite.visible = true` → `coating.replay([])`（重铺底图、零笔画，
+  涂层 100% 重建）→ `progress = 0` → `phase = 'ready'`。
+- onReveal 复位：靠状态机天然保证——`reveal()` 只在 `phase === 'ready'` 时放行，
+  reset 回到 ready 后 threshold/手动可再次触发且只触发一次。
+
+### 11.2 reset 的两个竞态与处理
+
+- **竞态①：揭晓淡出动画进行中 reset**。旧实现淡出 ticker 每帧递减 `sprite.alpha`，
+  若 reset 只把 alpha 设回 1 而不摘 ticker，旧 ticker 会继续递减，把涂层卡在半透明
+  （且最终 `finish()` 会把 `visible` 置 false，复位失败）。处理：`reveal()` 把 ticker
+  回调存入 `fadeTicker`，`reset()`/`destroy()` 先 `app.ticker.remove(fadeTicker)`
+  再复原 alpha/visible；ticker 自然结束时把引用置 null，避免重复 remove。
+- **竞态②：reset 与进行中的覆盖率读回**。`doMeasure()` 是 async，`await extract.pixels`
+  期间发生 reset 时，读回结果基于旧 RT（高刮除比例），若在 reset 后落库会立刻误触发
+  `reveal('threshold')`——表现为「刚复位就自动揭晓 + onReveal 紧接二次触发」。
+  处理：`state.epoch` 世代号，reset 时递增；doMeasure 在 await 前取快照，
+  await 返回后比对，不一致直接丢弃本次结果。
+
+### 11.3 会话序列化 / 重放
+
+- `exportSession()`：返回 `{ version: 1, options, strokes }` 纯数据（深拷贝）。
+  options 只收可序列化子集（尺寸取运行时实际逻辑尺寸；回调、PIXI.Texture 等剔除；
+  coating 仅颜色/纹理 URL、prize 仅 URL/null 才入档）。格式版本号 `SESSION_VERSION = 1`，
+  不兼容变更时递增。
+- `replaySession(data)`：`parseSession` 先校验版本与点坐标（非法数据抛错，视为编程错误），
+  `buildStrokes` 用与实时输入**同一套** `createStroke/addPoint` 重建笔画，逐笔
+  `pushStroke` + `coating.erase(strokeCommands(s))` 增量擦除，最后 `requestMeasure()`
+  让 threshold 逻辑对重放结果同样生效。
+- **undo 等价性论证**：undo = 弹栈 + 清 RT 重放剩余笔画（`strokeCommands` 全量推导）；
+  「少一笔数据直接回放」= 同样的 `strokeCommands` 序列少最后一笔。两条路径的命令
+  生成函数、命令顺序、擦除入口完全一致，仅差最后一笔，故重放后 undo 一笔 ≡ 少一笔
+  回放（同一确定性代码路径，无浮点分叉）。
+
+### 11.4 故障隔离
+
+实现要点见 §10.2。`main.js` 演示挂载 3 卡组（`mountScratchCardGroup(hosts)`），
+HMR dispose 调 `group.destroy()` 全组销毁。
+
+### 11.5 自评：最可能出问题的两个边界（推理，未实测）
+
+1. **跨尺寸 replaySession**：会话记录的是录制时的逻辑宽高，重放到尺寸不同的新卡
+   （如会话在 320×180 录制、重放卡是 480×270）时，笔画坐标不做仿射映射，笔迹会
+   偏移/截断。当前实现按「同规格卡重放」假设处理（resize 路径才有比例映射，
+   replaySession 未复用），跨尺寸重放是已知缺口。
+2. **reset 与 resize 异步窗口叠加**：`resize()` 是 async 且内部 `await coating.resize`，
+   若 revealed 态先触发 resize、await 期间用户 reset，reset 的 `coating.replay([])`
+   会作用在「旧尺寸 RT」上，随后 resize 的 `replayAll()` 又以空栈重铺——最终视觉
+   正确（都是满涂层），但 `state.busy` 在 revealed 态不被 reset 检查，极端时序下
+   可能出现一次被丢弃的复位（reset 返回 true 但随后被 resize 重放覆盖为等价结果，
+   影响可控）。评估为低风险，未加锁，留作观察项。
+
+### 11.6 验证与自检
+
+- `npm run build` 通过（pixi 仍为独立懒加载 chunk，入口 chunk 体积无异常）。
+- 白名单自检：`git status --short` 仅显示 `src/main.js`（M）、`src/scratch/index.js`（M）、
+  `src/scratch/mountScratchCard.js`（M）、`src/scratch/group.js`（新增）、
+  `src/scratch/session.js`（新增）——白名单外零改动。

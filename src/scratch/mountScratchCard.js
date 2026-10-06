@@ -11,9 +11,10 @@ import { createStage, buildPrize } from './createStage.js'
 import { createCoating } from './createCoating.js'
 import { attachPointerInput } from './pointerInput.js'
 import { createStroke, addPoint, endStroke, strokeCommands } from './stroke.js'
-import { createHistory, pushStroke, popStroke, strokeCount } from './strokeHistory.js'
+import { createHistory, pushStroke, popStroke, clearHistory, strokeCount } from './strokeHistory.js'
 import { measureCoverage } from './coverage.js'
 import { clamp, resolveDPR } from './math.js'
+import { createSession, parseSession, buildStrokes } from './session.js'
 
 const mounted = new WeakSet() // 重复挂载防护（HMR 叠加的根因防线，DESIGN.md §5 风险#4）
 
@@ -36,6 +37,7 @@ export function mountScratchCard(el, options = {}) {
     resolution: 1,
     progress: 0,
     busy: false, // context lost / 重建中，忽略输入
+    epoch: 0, // 逻辑世代号：reset 时递增，用于作废进行中的异步读回结果
   }
   const history = createHistory()
   let currentStroke = null
@@ -50,6 +52,7 @@ export function mountScratchCard(el, options = {}) {
   let measureScheduled = false
   let measuring = false
   let lastMeasureAt = 0
+  let fadeTicker = null // 揭晓淡出动画的 ticker 回调（reset/destroy 时须摘除）
 
   const stats = { readbackMs: 0, readbackCount: 0, replayCount: 0 }
 
@@ -202,11 +205,15 @@ export function mountScratchCard(el, options = {}) {
     if (state.phase !== 'ready' || state.revealed || destroyed) return
     measuring = true
     lastMeasureAt = performance.now()
+    const epoch = state.epoch
     try {
       const { ratio, ms } = await measureCoverage(app.renderer, coating.rt, {
         resolution: opts.coverageResolution,
         stride: opts.coverageStride,
       })
+      // 读回 await 期间发生 reset/重建：结果基于旧 RT，直接作废，
+      // 否则陈旧比例可能在 reset 后立刻误触发 reveal（DESIGN.md §11.2）
+      if (destroyed || epoch !== state.epoch) return
       stats.readbackMs = ms
       stats.readbackCount++
       state.progress = ratio
@@ -245,6 +252,7 @@ export function mountScratchCard(el, options = {}) {
     const sprite = coating.sprite
     const finish = () => {
       sprite.visible = false
+      fadeTicker = null
     }
     if (reducedMotion.matches || opts.revealFadeMs <= 0) {
       sprite.alpha = 0
@@ -258,11 +266,51 @@ export function mountScratchCard(el, options = {}) {
           finish()
         }
       }
+      fadeTicker = fade
       app.ticker.add(fade)
     }
     state.progress = 1
     opts.onProgress?.(1)
     opts.onReveal?.(reason) // 状态机保证只触发一次
+  }
+
+  // ---- 复位（revealed → ready，DESIGN.md §11.2）----
+  function reset() {
+    if (state.phase !== 'revealed' || destroyed) return false
+    state.epoch++ // 作废进行中的覆盖率读回（竞态①：陈旧比例误触发揭晓）
+    clearHistory(history) // 笔画栈清空
+    currentStroke = null
+    // 竞态②：淡出动画进行中 reset——先摘 ticker 再复原 alpha，
+    // 否则旧 ticker 继续递减会把涂层卡在半透明
+    if (fadeTicker && app) {
+      app.ticker.remove(fadeTicker)
+      fadeTicker = null
+    }
+    const sprite = coating.sprite
+    sprite.alpha = 1
+    sprite.visible = true
+    coating.replay([]) // 涂层 100% 重建：重铺底图、零笔画
+    state.progress = 0
+    state.phase = 'ready' // onReveal 复位：threshold 可再次触发
+    return true
+  }
+
+  // ---- 会话序列化 / 重放（DESIGN.md §11.3）----
+  function exportSession() {
+    return createSession(opts, state, history)
+  }
+
+  function replaySession(data) {
+    if (state.phase !== 'ready' || state.busy || destroyed) return false
+    const session = parseSession(data) // 非法数据抛错（编程错误，显式失败）
+    for (const stroke of buildStrokes(session)) {
+      pushStroke(history, stroke)
+      // 与实时刮擦共用同一套点→命令推导，逐笔增量擦除：
+      // 之后 undo 弹栈重放剩余笔画，与「少一笔数据直接回放」逐命令一致
+      coating.erase(strokeCommands(stroke))
+    }
+    requestMeasure()
+    return true
   }
 
   // ---- resize（窗口/旋转/地址栏，rAF 合帧）----
@@ -336,6 +384,10 @@ export function mountScratchCard(el, options = {}) {
     destroyed = true
     state.phase = 'destroyed'
     if (resizeRaf) cancelAnimationFrame(resizeRaf)
+    if (fadeTicker && app) {
+      app.ticker.remove(fadeTicker)
+      fadeTicker = null
+    }
     ro.disconnect()
     el.removeEventListener('keydown', onKeydown)
     if (detachInput) detachInput()
@@ -366,6 +418,9 @@ export function mountScratchCard(el, options = {}) {
     ready,
     reveal: () => reveal('manual'),
     undo,
+    reset,
+    exportSession,
+    replaySession,
     getProgress: () => state.progress,
     resize: (w, h) => {
       if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {

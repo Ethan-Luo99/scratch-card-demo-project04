@@ -3,7 +3,7 @@ import heroImg from './assets/hero.png'
 import javascriptLogo from './assets/javascript.svg'
 import viteLogo from './assets/vite.svg'
 import { setupCounter } from './counter.js'
-import { mountScratchCard } from './scratch/index.js'
+import { mountScratchCardGroup } from './scratch/index.js'
 
 document.querySelector('#app').innerHTML = `
 <section id="center">
@@ -60,13 +60,17 @@ document.querySelector('#app').innerHTML = `
 
 setupCounter(document.querySelector('#counter'))
 
-const scratchHost = document.createElement('div')
-scratchHost.id = 'scratch-card'
-scratchHost.style.cssText =
-  'width:320px;height:180px;margin:24px auto;border-radius:12px;overflow:hidden;'
-document.querySelector('#app').appendChild(scratchHost)
-const scratchCard = mountScratchCard(scratchHost)
+const scratchHosts = []
+for (let i = 0; i < 3; i++) {
+  const host = document.createElement('div')
+  host.className = 'scratch-card'
+  host.style.cssText =
+    'width:320px;height:180px;margin:24px auto;border-radius:12px;overflow:hidden;'
+  document.querySelector('#app').appendChild(host)
+  scratchHosts.push(host)
+}
+const scratchGroup = mountScratchCardGroup(scratchHosts)
 
 if (import.meta.hot) {
-  import.meta.hot.dispose(() => scratchCard.destroy())
+  import.meta.hot.dispose(() => scratchGroup.destroy())
 }
