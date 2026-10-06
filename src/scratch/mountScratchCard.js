@@ -4,6 +4,7 @@
  *
  * 状态机（DESIGN.md §3.4）：
  *   idle →(init 完成)→ ready ⇄ scratching →(阈值/手动)→ revealed（终态）
+ *   revealed →(reset)→ ready（增强包：涂层重建 + 笔画栈清空 + onReveal 复位，§11.2）
  *   destroy() 可从任意态进入 destroyed（幂等）。
  */
 import { DEFAULT_OPTIONS } from './defaultOptions.js'
@@ -11,9 +12,16 @@ import { createStage, buildPrize } from './createStage.js'
 import { createCoating } from './createCoating.js'
 import { attachPointerInput } from './pointerInput.js'
 import { createStroke, addPoint, endStroke, strokeCommands } from './stroke.js'
-import { createHistory, pushStroke, popStroke, strokeCount } from './strokeHistory.js'
+import {
+  createHistory,
+  pushStroke,
+  popStroke,
+  clearHistory,
+  strokeCount,
+} from './strokeHistory.js'
 import { measureCoverage } from './coverage.js'
 import { clamp, resolveDPR } from './math.js'
+import { serializeSession, validateSession } from './session.js'
 
 const mounted = new WeakSet() // 重复挂载防护（HMR 叠加的根因防线，DESIGN.md §5 风险#4）
 
@@ -47,6 +55,7 @@ export function mountScratchCard(el, options = {}) {
   let detachInput = null
   let destroyed = false
   let resizeRaf = 0
+  let fadeTick = null // 进行中的揭晓淡出 ticker 回调（reset 竞态收口，§11.2）
   let measureScheduled = false
   let measuring = false
   let lastMeasureAt = 0
@@ -244,6 +253,7 @@ export function mountScratchCard(el, options = {}) {
     currentStroke = null
     const sprite = coating.sprite
     const finish = () => {
+      fadeTick = null
       sprite.visible = false
     }
     if (reducedMotion.matches || opts.revealFadeMs <= 0) {
@@ -258,11 +268,54 @@ export function mountScratchCard(el, options = {}) {
           finish()
         }
       }
+      fadeTick = fade
       app.ticker.add(fade)
     }
     state.progress = 1
     opts.onProgress?.(1)
     opts.onReveal?.(reason) // 状态机保证只触发一次
+  }
+
+  // ---- 复位（revealed/ready → ready，§11.2）----
+  // 涂层 100% 重建（空命令 replay = 重铺底图）、笔画栈清空、progress/onReveal 复位；
+  // 进行中的揭晓淡出先摘 ticker 再恢复 sprite，杜绝半透明涂层卡死。
+  function reset() {
+    if (destroyed) return false
+    if (state.phase !== 'revealed' && state.phase !== 'ready') return false
+    if (fadeTick && app) {
+      app.ticker.remove(fadeTick) // 竞态收口：淡出进行中 reset，先停动画
+      fadeTick = null
+    }
+    currentStroke = null
+    clearHistory(history)
+    state.progress = 0
+    const sprite = coating.sprite
+    sprite.alpha = 1
+    sprite.visible = true
+    try {
+      coating.replay([]) // 空命令 = 仅重铺底图，涂层 100% 复原
+    } catch {
+      /* context lost 中渲染失败：onContextRestored 的 replayAll（空栈=满涂层）兜底 */
+    }
+    state.phase = 'ready' // onReveal 守卫随相位复位，threshold 可再次触发
+    return true
+  }
+
+  // ---- 会话序列化 / 重放（§11.3）----
+  function exportSession() {
+    return serializeSession(opts, state, history)
+  }
+
+  function replaySession(data) {
+    if (destroyed) return false
+    const session = validateSession(data) // 非法数据抛 TypeError，由调用方收口
+    if (state.phase === 'revealed') reset() // 终态先复位（含淡出竞态收口）
+    if (state.phase !== 'ready' || state.busy) return false
+    clearHistory(history)
+    for (const s of session.strokes) pushStroke(history, s)
+    replayAll() // 与 undo 共用同一确定性重放：undo 一笔 ≡ 少一笔数据直接回放
+    requestMeasure()
+    return true
   }
 
   // ---- resize（窗口/旋转/地址栏，rAF 合帧）----
@@ -366,6 +419,9 @@ export function mountScratchCard(el, options = {}) {
     ready,
     reveal: () => reveal('manual'),
     undo,
+    reset,
+    exportSession,
+    replaySession,
     getProgress: () => state.progress,
     resize: (w, h) => {
       if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {

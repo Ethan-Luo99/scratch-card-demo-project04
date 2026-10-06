@@ -3,3 +3,5 @@
  * 与现有 setupCounter 互不引用、可同页共存。
  */
 export { mountScratchCard } from './mountScratchCard.js'
+export { mountScratchCardGroup } from './group.js'
+export { SESSION_VERSION } from './session.js'

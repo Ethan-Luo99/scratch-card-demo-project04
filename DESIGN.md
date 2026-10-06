@@ -756,3 +756,111 @@ OK                      ← counter.js 与 index.html 逐字节未变
 `src/main.js` diff 仅为：① `import { mountScratchCard } from './scratch/index.js'`；
 ② 末尾一个挂载块（建宿主 div + 一次 `mountScratchCard` 调用）；
 ③ `import.meta.hot.dispose(() => scratchCard.destroy())`。其余现有文件零改动。
+
+---
+
+## 10. 运营增强包 · 多卡组架构决策（2026-10-06）
+
+### 10.1 关键取舍：共享一个 Application vs 每卡独立 Application
+
+**决策：每卡独立 `PIXI.Application`（`src/scratch/group.js` 逐卡调用
+`mountScratchCard`，不改单卡内部任何渲染结构）。** 三维权衡：
+
+| 维度 | 共享一个 Application（多卡同 stage） | 每卡独立 Application（选定） |
+| --- | --- | --- |
+| WebGL 上下文数量 | 只占 1 个上下文，N 可扩展到几十张 | 每张卡 1 个上下文；浏览器对单页面活动上下文有上限（Chrome 约 16、Safari 更紧），超限后最旧上下文被强制丢失。**N≥3 的运营位（个位数）远未触顶，可接受**；若未来要几十张卡需重评共享方案 | 
+| 显存 | 共享 renderer/批处理/纹理缓，总量显存最省 | 每卡独立 renderer + 独立图层 RT，显存随 N 线性增长；但单卡 RT 仅 320×180×2 级，总量仍小 |
+| 隔离性 | 单点故障面 = 全部卡：一次 context lost 全组挂起、一次 `app.destroy` 全组销毁、一卡异常渲染可能拖垮整 stage | **结构级隔离**：context lost / destroy / init 失败都以单卡为边界，天然满足本轮「故障隔离」硬需求 |
+
+结论：本轮需求 4（单卡 init 失败 / destroy / context lost 不波及邻卡）是硬约束，
+共享 stage 方案下需要额外手写大量隔离与降级逻辑才能逼近，而独立 Application
+方案「零额外代码」即达成；其代价（上下文数量、显存）在 N 为个位数的运营场景下
+不构成风险。故选独立 Application，并把「N 上限 ≈ 浏览器 WebGL 上下文上限」
+记为已知约束。
+
+### 10.2 group.js 形态
+
+- `mountScratchCardGroup(el, cards, options)`：`cards` 为数量或逐卡配置数组
+  （每项可自带 `el` 或 `cellStyle`，其余透传单卡 options；`options` 为全组共享配置）。
+- 组只负责「格子布局 + 逐卡挂载 + 聚合句柄」，不侵入单卡状态机；
+  返回 `{ cards, ready, aliveCount(), resetAll(), destroy() }`。
+
+---
+
+## 11. 运营增强包 · 实现说明（2026-10-06）
+
+### 11.1 ScratchCardGroup（需求 1）
+
+- 实现：`src/scratch/group.js`，每卡独立 Application（§10.1）。组容器用
+  inline flex 布局（不改 `src/style.css`），逐卡创建格子 div 并挂载。
+- `src/main.js` 仅一处最小追加式替换：单卡挂载块 → `mountScratchCardGroup(host, 3)`，
+  HMR dispose 同步改为 `scratchGroup.destroy()`。
+
+### 11.2 reset()（需求 2）
+
+- 实现：`mountScratchCard.js` 新增 `reset()`，允许 `revealed` 与 `ready` 两相进入：
+  摘淡出 ticker → 清当前笔与笔画栈（`clearHistory`）→ `progress=0` →
+  sprite `alpha=1 / visible=true` → `coating.replay([])`（空命令 = 仅重铺底图，
+  涂层 100% 重建）→ 相位回 `ready`。
+- **淡出竞态处理**：`reveal()` 把淡出回调存入 `fadeTick`；`reset()` 先
+  `app.ticker.remove(fadeTick)` 再恢复 sprite，淡出不会在中途被「冻结」成半透明，
+  也不会在 reset 后继续扣 alpha。`finish()` 与 reset 都会清 `fadeTick`，
+  时序任意交错均安全（remove 已移除的回调是 no-op）。
+- **onReveal 二次触发**：`onReveal` 在 `reveal()` 内同步调用一次，守卫是
+  `phase === 'ready'`；reset 把相位复位后 threshold 可再次触发新一轮
+  `onReveal`——这是「复位」而非「重发」，同一次揭晓不可能触发两次。
+- **context lost 中 reset**：`coating.replay([])` 渲染失败被 try/catch 吞掉，
+  `onContextRestored` 的 `replayAll()` 在空栈下同样重铺满涂层，状态自洽。
+
+### 11.3 会话序列化（需求 3）
+
+- 实现：`src/scratch/session.js`（纯数据纯逻辑）+ 卡句柄方法
+  `exportSession()` / `replaySession(data)`。
+- 格式带 `version: 1`（`SESSION_VERSION` 导出）；`card` 只保留可序列化子集
+  （回调、Texture 不落盘，非 string/number 的 coating/prize 记 `null`），
+  `strokes` 为点序列深拷贝，整体可 `JSON.stringify`。
+- `replaySession` 先 `validateSession`（版本不符 / 结构残缺 / 坐标非有限数 →
+  抛 TypeError），revealed 态先内部 `reset()` 再灌入笔画、`replayAll()` 重放、
+  调度一次覆盖率测量（重放满刮会话可正常触发 threshold 揭晓）。
+- **undo 等价性**：undo = 弹栈 + 同一确定性 `replayAll()`（命令仅由点数据推导，
+  无随机、无时间依赖），因此「replay 后 undo 一笔」与「少一笔数据直接回放」
+  产出的命令序列逐条相同，状态必然等价。
+
+### 11.4 故障隔离（需求 4）
+
+- 单卡 init 失败：逐卡 `try/catch`（同步挂载错误，如非法容器）+
+  `handle.ready.catch`（异步 init 错误，如 WebGL 不可用 / 纹理加载失败），
+  失败仅标记该 entry，循环继续，其余卡不受影响。
+- 单卡 destroy / context lost：每卡独立 Application 与 canvas（§10.1），
+  结构上互不可达；group `destroy()` 逐卡 try/catch，单卡销毁异常不中断其余卡。
+- `aliveCount()` = 已挂载 && 未标记失败 && `diagnostics().phase !== 'destroyed'`
+  的卡数，实时计算、不缓存。
+
+### 11.5 状态机增量
+
+```
+idle →(init 完成)→ ready ⇄ scratching →(阈值/手动)→ revealed
+                      ↑__________ reset() __________|
+destroy() 可从任意态进入 destroyed（幂等）
+```
+
+### 11.6 最可能出问题的两个边界（推理，未跑实测）
+
+1. **reset 与进行中 coverage 读回的交错**：`doMeasure()` 是 async（`extract.pixels`
+    await 读回）。若 reset 发生在 await 悬停期间，读回返回后旧回调会继续执行
+   `onProgress(ratio)` 并可能以「旧涂层的覆盖率」触发 `reveal('threshold')`——
+   新涂层刚重建就被瞬间揭晓。缓解事实：`doMeasure` 入口与 reveal 守卫都检查
+   `phase === 'ready'`，reset 后相位恰为 `ready`，守卫**拦不住**这次过期回调；
+   当前仅靠「读回耗时远小于人手 reset 间隔」规避。根治方案（未做，记录在案）：
+   reset 时递增 `state.epoch`，`doMeasure` 捕获时快照、返回后比对 epoch 不符即丢弃。
+2. **group 在低端机/多卡时的上下文压力**：N 张卡 = N 个 WebGL 上下文 +
+   N 份 RT。Safari（尤其 iOS）上下文上限更紧且超限策略是「踢掉最旧上下文」，
+   表现为最早挂载的卡突然 context lost 循环重建。`onContextRestored` 已有
+   重放兜底不会白屏，但频繁丢失会抖动。已知约束：本组定位 N 为个位数；
+   若运营位扩到两位数，需回到 §10.1 重评共享 stage 或懒挂载（视口内才 init）。
+
+### 11.7 白名单自检
+
+交付前 `git status --porcelain` 结果：改动仅 `DESIGN.md`、`src/main.js`、
+`src/scratch/**`（含新增 `group.js` / `session.js`），白名单外零改动
+（`npm ci` 只落 `node_modules/`，未触碰 `package.json` / `package-lock.json`）。
