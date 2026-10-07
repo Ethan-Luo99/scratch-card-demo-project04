@@ -70,6 +70,54 @@ for (let i = 0; i < 3; i++) {
   scratchHosts.push(host)
 }
 const scratchGroup = mountScratchCardGroup(scratchHosts)
+window.__scratchGroup = scratchGroup // 人工验证挂钩（DESIGN.md §12.6）
+
+// —— 增强包二期：重放演示（唯一追加块）——
+// 一个按钮演示两件事：
+// ① 跨尺寸会话重放：导出第 1 张卡的会话，重放进一张 300×240（宽高比不同）的新卡，
+//    笔迹应按「录制尺寸 → 目标尺寸」仿射映射（刮到哪里、重放就在哪里）；
+// ② 组级连锁揭晓：随重放卡新建一个 chainReveal:true 的 3 卡组，
+//    把该组任一卡刮到自动揭晓（或聚焦后按回车），其余两卡应在约 100/200ms 后
+//    依次自行演示揭晓，且控制台只有真实揭晓那一条 onReveal 日志。
+{
+  const replayBtn = document.createElement('button')
+  replayBtn.type = 'button'
+  replayBtn.className = 'counter'
+  replayBtn.textContent = '重放演示（跨尺寸 + 连锁揭晓）'
+  replayBtn.style.cssText = 'display:block;margin:0 auto 24px;'
+  replayBtn.addEventListener('click', async () => {
+    const source = scratchGroup.cards[0]
+    if (!source) return
+    await source.ready
+    let session
+    try {
+      session = source.exportSession()
+    } catch (err) {
+      window.alert(`重放演示导出失败：${err.message}`)
+      return
+    }
+    const section = document.createElement('section')
+    section.style.cssText = 'text-align:center;'
+    const hosts = []
+    for (let i = 0; i < 3; i++) {
+      const host = document.createElement('div')
+      host.className = 'scratch-card'
+      host.style.cssText =
+        'display:inline-block;width:300px;height:240px;margin:12px;border-radius:12px;overflow:hidden;'
+      section.appendChild(host)
+      hosts.push(host)
+    }
+    document.querySelector('#app').appendChild(section)
+    const demoGroup = mountScratchCardGroup(hosts, {
+      chainReveal: true,
+      onReveal: (reason) => console.log('[demo] 真实揭晓 onReveal:', reason),
+    })
+    window.__lastDemoGroup = demoGroup // 人工验证挂钩（DESIGN.md §12.6 步骤 4）
+    await demoGroup.cards[0].ready
+    demoGroup.cards[0].replaySession(session)
+  })
+  document.querySelector('#app').appendChild(replayBtn)
+}
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => scratchGroup.destroy())

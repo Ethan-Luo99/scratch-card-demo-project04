@@ -18,6 +18,9 @@ export const DEFAULT_OPTIONS = {
   coating: '#b8b8c4',
   // 达到阈值是否自动揭开
   revealOnThreshold: true,
+  // 组级连锁揭晓开关（仅 mountScratchCardGroup 生效，DESIGN.md §12.4）：
+  // 组内任一卡真实揭晓后，其余存活卡依次执行演示性质的 reset+reveal
+  chainReveal: false,
   // 覆盖率读回参数（DESIGN.md §4.7：降分辨率 + stride 抽样 + 节流）
   coverageResolution: 0.5,
   coverageStride: 4,

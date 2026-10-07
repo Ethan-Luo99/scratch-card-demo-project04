@@ -38,6 +38,7 @@ export function mountScratchCard(el, options = {}) {
     progress: 0,
     busy: false, // context lost / 重建中，忽略输入
     epoch: 0, // 逻辑世代号：reset 时递增，用于作废进行中的异步读回结果
+    chainLocked: false, // 连锁揭晓预约锁（DESIGN.md §12.4）：true 时拒绝一切用户输入
   }
   const history = createHistory()
   let currentStroke = null
@@ -160,7 +161,7 @@ export function mountScratchCard(el, options = {}) {
 
   // ---- 刮擦输入 ----
   function onStrokeStart(x, y) {
-    if (state.phase !== 'ready' || state.busy) return
+    if (state.phase !== 'ready' || state.busy || state.chainLocked) return
     currentStroke = createStroke()
     const cmd = addPoint(currentStroke, clamp(x, 0, state.logicalW), clamp(y, 0, state.logicalH))
     coating.erase([cmd])
@@ -168,7 +169,7 @@ export function mountScratchCard(el, options = {}) {
   }
 
   function onStrokeMove(x, y) {
-    if (!currentStroke || state.phase !== 'ready' || state.busy) return
+    if (!currentStroke || state.phase !== 'ready' || state.busy || state.chainLocked) return
     // 卡外坐标 clamp 到边界：沿边滑动不断线，且不结束笔画（DESIGN.md §4.5）
     const cmd = addPoint(currentStroke, clamp(x, 0, state.logicalW), clamp(y, 0, state.logicalH))
     coating.erase([cmd])
@@ -176,7 +177,11 @@ export function mountScratchCard(el, options = {}) {
   }
 
   function onStrokeEnd() {
-    if (!currentStroke) return
+    // 连锁预约/状态切换期间笔事件落进来：整笔丢弃，绝不入栈
+    if (!currentStroke || state.phase !== 'ready' || state.busy || state.chainLocked) {
+      currentStroke = null
+      return
+    }
     const tail = endStroke(currentStroke)
     if (tail) coating.erase([tail])
     pushStroke(history, currentStroke)
@@ -236,7 +241,7 @@ export function mountScratchCard(el, options = {}) {
 
   // ---- 撤销 ----
   function undo() {
-    if (state.phase !== 'ready' || state.busy || destroyed) return false
+    if (state.phase !== 'ready' || state.busy || state.chainLocked || destroyed) return false
     const s = popStroke(history)
     if (!s) return false
     replayAll() // 清 RT 重放剩余笔画；撤到空栈 = 涂层 100% 复原，不触发揭晓
@@ -245,7 +250,7 @@ export function mountScratchCard(el, options = {}) {
   }
 
   // ---- 揭晓（一次性终态）----
-  function reveal(reason) {
+  function reveal(reason, silent = false) {
     if (state.phase !== 'ready' || destroyed) return
     state.phase = 'revealed'
     currentStroke = null
@@ -270,14 +275,17 @@ export function mountScratchCard(el, options = {}) {
       app.ticker.add(fade)
     }
     state.progress = 1
-    opts.onProgress?.(1)
-    opts.onReveal?.(reason) // 状态机保证只触发一次
+    if (!silent) {
+      opts.onReveal?.(reason) // 状态机保证只触发一次；连锁演示（silent）不触发 onReveal
+    }
+    opts.onProgress?.(1) // progress 反映真实覆盖率状态，演示揭晓同样上报
   }
 
   // ---- 复位（revealed → ready，DESIGN.md §11.2）----
   function reset() {
     if (state.phase !== 'revealed' || destroyed) return false
     state.epoch++ // 作废进行中的覆盖率读回（竞态①：陈旧比例误触发揭晓）
+    state.chainLocked = false // 释放可能存在的连锁预约/演示锁（DESIGN.md §12.4）
     clearHistory(history) // 笔画栈清空
     currentStroke = null
     // 竞态②：淡出动画进行中 reset——先摘 ticker 再复原 alpha，
@@ -297,13 +305,26 @@ export function mountScratchCard(el, options = {}) {
 
   // ---- 会话序列化 / 重放（DESIGN.md §11.3）----
   function exportSession() {
+    if (destroyed) {
+      throw new Error('exportSession: 卡片已销毁')
+    }
+    if (state.phase === 'idle' || state.phase === 'init' || !(state.logicalW > 0)) {
+      throw new Error('exportSession: 卡片尚未就绪（逻辑尺寸未知），无一致快照可导出')
+    }
+    // 原子性（DESIGN.md §12.2）：有一笔正在刮时显式失败，绝不导出半笔。
+    // 进行中的读回/淡出只写 progress 与 sprite.alpha（均不入快照），无需等待、
+    // 不阻塞链路；快照读取的 history/logicalW/H 在同步执行期间不可能被交错改写。
+    if (currentStroke) {
+      throw new Error('exportSession: 有一笔尚未提交，请在 pointerup 后导出')
+    }
     return createSession(opts, state, history)
   }
 
   function replaySession(data) {
-    if (state.phase !== 'ready' || state.busy || destroyed) return false
-    const session = parseSession(data) // 非法数据抛错（编程错误，显式失败）
-    for (const stroke of buildStrokes(session)) {
+    if (state.phase !== 'ready' || state.busy || state.chainLocked || destroyed) return false
+    const session = parseSession(data) // v1 入口无损升级 v2；非法数据抛错（显式失败）
+    // 归一化坐标 → 本卡当前逻辑尺寸（录制基准 → 目标尺寸的线性仿射映射）
+    for (const stroke of buildStrokes(session, state.logicalW, state.logicalH)) {
       pushStroke(history, stroke)
       // 与实时刮擦共用同一套点→命令推导，逐笔增量擦除：
       // 之后 undo 弹栈重放剩余笔画，与「少一笔数据直接回放」逐命令一致
@@ -333,17 +354,18 @@ export function mountScratchCard(el, options = {}) {
     state.logicalH = h
     state.resolution = resolveDPR(opts.maxPixelRatio)
     state.busy = true
+    // 坐标映射必须在首个 await 之前同步完成（DESIGN.md §12.2）：
+    // 否则 await 期间 exportSession 会读到「新尺寸 + 旧像素坐标」的撕裂快照
+    for (const s of history.strokes) {
+      for (const p of s.points) {
+        p.x *= sx
+        p.y *= sy
+      }
+    }
     try {
       app.renderer.resize(w, h, state.resolution)
       await coating.resize(w, h, state.resolution)
       if (destroyed) return
-      // 笔画坐标按新旧比例线性映射后重放（DESIGN.md §4.6）
-      for (const s of history.strokes) {
-        for (const p of s.points) {
-          p.x *= sx
-          p.y *= sy
-        }
-      }
       await buildPrize(PIXI, prizeLayer, opts.prize, w, h)
       replayAll()
       if (state.phase === 'ready') requestMeasure()
@@ -369,9 +391,11 @@ export function mountScratchCard(el, options = {}) {
   function onKeydown(e) {
     if (destroyed) return
     if (e.key === 'Enter' || e.key === ' ') {
+      if (state.chainLocked) return // 连锁预约期间键盘揭晓同样拒绝
       e.preventDefault()
       reveal('manual')
     } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      if (state.chainLocked) return
       e.preventDefault()
       undo()
     }
@@ -383,6 +407,7 @@ export function mountScratchCard(el, options = {}) {
     if (destroyed) return
     destroyed = true
     state.phase = 'destroyed'
+    state.chainLocked = false // 组级连锁定时器由 group 侧清理；此处仅解除自身输入锁
     if (resizeRaf) cancelAnimationFrame(resizeRaf)
     if (fadeTicker && app) {
       app.ticker.remove(fadeTicker)
@@ -421,6 +446,24 @@ export function mountScratchCard(el, options = {}) {
     reset,
     exportSession,
     replaySession,
+    /**
+      * 组级连锁内部原语（DESIGN.md §12.4，下划线前缀=非业务 API，仅 group 调用）：
+      * _chainArm() 预约锁定：仅 ready 卡可预约，立即拒绝之后的全部用户输入；
+      * _chainPlay() 到点执行：reset 清卡 + 静默 reveal（不触发 onReveal），幂等。
+      */
+    _chainArm() {
+      if (destroyed || state.busy || state.chainLocked || state.phase !== 'ready') {
+        return false
+      }
+      state.chainLocked = true
+      return true
+    },
+    _chainPlay() {
+      if (destroyed) return
+      state.chainLocked = true // 保险：即便未经过 arm（理论不会发生）也拒绝输入
+      reset() // revealed→ready；ready 卡调用返回 false 也不影响后续 reveal
+      reveal('chain', true) // silent：演示揭晓，不触发 onReveal（状态机一次性保证）
+    },
     getProgress: () => state.progress,
     resize: (w, h) => {
       if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {

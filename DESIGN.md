@@ -851,3 +851,168 @@ HMR dispose 调 `group.destroy()` 全组销毁。
 - 白名单自检：`git status --short` 仅显示 `src/main.js`（M）、`src/scratch/index.js`（M）、
   `src/scratch/mountScratchCard.js`（M）、`src/scratch/group.js`（新增）、
   `src/scratch/session.js`（新增）——白名单外零改动。
+
+## 12. 增强包二期：会话可靠性与联动揭晓（2026-10-07）
+
+本期改动文件：`src/scratch/session.js`（格式 v2）、`src/scratch/mountScratchCard.js`
+（跨尺寸重放 / 导出原子性 / 连锁原语）、`src/scratch/group.js`（连锁编排）、
+`src/scratch/defaultOptions.js`（新增 `chainReveal` 开关）、
+`src/main.js`（挂载块尾部追加唯一一个「重放演示」按钮）。未新增任何依赖。
+
+### 12.1 功能点一：跨尺寸会话重放（含与 resize 映射的坐标系约定）
+
+- v2 会话里笔画点一律存**归一化坐标**（`x/y ∈ 0..1` 浮点），录制基准尺寸单独放在
+  顶层显式字段 `canvas: { width, height }`，不再隐含在 `options.width/height` 里。
+- `replaySession(data)` 调 `parseSession` 后，由 `buildStrokes(session, targetW, targetH)`
+  做「录制尺寸 → 目标尺寸」的线性仿射映射：目标像素 = 归一化 × 目标逻辑宽/高，
+  x、y 两个轴各自独立缩放（宽高比变化也不扭曲相对位置语义），映射结果再 clamp 到
+  `[0, targetW/H]`——与实时输入 `onStrokeStart/Move` 的 clamp 口径完全一致。
+- 映射后的点仍走与实时刮擦**同一个** `createStroke/addPoint` 点→命令推导，逐笔
+  `pushStroke` + `coating.erase(strokeCommands(s))`。因此「replay 后 undo 一笔」与
+  「少一笔的映射数据直接回放」仍是同一确定性代码路径（命令生成函数、顺序、擦除入口
+  全一致，仅差最后一笔），undo 等价性在映射后继续成立。
+- **两处映射如何避免双重映射**。全代码库只有一个坐标系基准：**当前卡的逻辑 CSS
+  像素坐标**（`state.logicalW/H`，与 RT/舞台坐标系一致，见 §4.1）。坐标转换只允许
+  发生在两个系统的边界上，且各自只做一次：
+  1. resize 映射：像素（旧逻辑尺寸）→ 像素（新逻辑尺寸），在 `resize()` 内对
+     `history.strokes` 的点原地乘一次比例，比例 = 新尺寸/旧尺寸；
+  2. 会话边界映射：导出时像素 → 归一化（除当前尺寸）；重放时归一化 → 像素
+     （乘目标尺寸）。
+  关键纪律：归一化值**绝不**写回 `history`（history 永远只持当前卡逻辑像素），
+  `replaySession` 的映射结果只用于新建笔画对象，不修改 session 数据。于是「重放进
+  A 尺寸的卡 → 该卡 resize 到 B → 再导出 → 再重放到 C」这条链路上，每一段恰好做
+  一次自己的换算，不存在任何一段同时吃到两套比例的情况。
+
+### 12.2 功能点二：导出原子性（同步快照方案及其取舍）
+
+先盘点「导出瞬间可能正在进行」的三条链路，各自写入的状态如下：
+
+| 进行中的链路 | 写入的状态 | 是否进入会话快照 |
+| --- | --- | --- |
+| 一笔正在刮（`currentStroke` 未提交） | `currentStroke` + RT 像素（增量擦除） | 是（history 不受影响，currentStroke 是唯一会污染快照的来源） |
+| 覆盖率读回（await extract.pixels） | 完成后写 `state.progress`、可能触发 reveal | 否（progress 不入快照；reveal 只改相位/alpha） |
+| 揭晓淡出 ticker | 每帧写 `sprite.alpha`，结束写 `visible` | 否（快照只取 history 与逻辑尺寸） |
+
+- 选型：**同步快照 + 一个显式前置守卫**，不引入异步锁/世代号。
+  `exportSession()` 是纯同步函数；JS 单线程下，函数体执行期间不会有任何定时器、
+  读回回调、指针事件交错执行，所以它读到的 `history`（只在 `onStrokeEnd`/`undo`/
+  `reset`/`replaySession` 这些同步入口变更）与 `state.logicalW/H` 必然属于同一个
+  内部时刻，`createSession` 再对每点做一次数值拷贝（归一化产生新对象），快照与内部
+  状态彻底解耦。
+- 唯一会混入「半笔」的情况是 `currentStroke` 未提交。取舍：**显式抛错**
+  （`'有一笔尚未提交，请在 pointerup 后导出'`），而不是静默丢弃半笔或自动提交。
+  理由：调用方（运营后台/分享链路）通常在按钮点击时导出，此时不可能正处于按压中；
+  真在按压中触发只可能是编程错误，显式失败比悄悄改变笔画数更可排查。守卫不触碰
+  currentStroke、也不结束该笔，故不阻塞、不破坏正在进行的刮擦链路。
+- 读回/淡出无需等待：它们只写 progress 与 sprite.alpha，二者都不进快照；快照也不
+  反向读取它们。即便读回在导出返回后立刻落库并触发 reveal，已返回的 JSON 仍是导出
+  那一刻的一致状态，不受影响。
+- 顺带修掉一个撕裂窗口：原 `resize()` 在 `await coating.resize` **之后**才缩放笔画
+  点坐标，await 期间导出会读到「新 logicalW/H + 旧像素坐标」的撕裂快照。本期把
+  「更新 logicalW/H + 置 busy + 点坐标比例映射」整体移到**首个 await 之前**同步
+  完成（resize 入口在 rAF 回调中同步运行，期间无交错），await 期间 busy 又挡掉
+  undo/replaySession/输入，因此 resize 全程不存在不一致的可观测时刻。
+
+### 12.3 功能点三：会话格式 v2 与 v1 入口无损升级
+
+- `SESSION_VERSION` 升到 `2`。字段调整：
+  - 新增顶层 `canvas: { width, height }` 作为**显式画布基准**（v1 时它隐含在
+    `options.width/height` 里）；
+  - `strokes[].points[]` 由录制尺寸下的逻辑像素改为**归一化 0..1 浮点**；
+  - `options` 不再携带 `width/height`（避免与基准字段双份不一致），其余可序列化
+       键不变。
+- `parseSession(data)` 是唯一入口：
+  - `version === 1`：调 `upgradeV1` 升级——校验 `options.width/height` 为正数后，
+       每点做 `x/width`、`y/height` 的确定性除法，基准提升为顶层 `canvas`，options
+       按白名单搬运。升级只乘除常数、不增删点、不重推命令，且除法是「像素→归一化」
+       的精确逆运算（同尺寸回放时再乘回去），故为无损；
+  - `version === 2`：直接走统一校验；
+  - 升级/校验之后内部只有一条 v2 路径，`buildStrokes` 不再关心来源版本。
+- 显式报错保持并收紧：版本既不是 1 也不是 2 → `Error('不支持的会话版本 …')`；
+  `canvas` 缺失/非正 → `TypeError`；`strokes`/`points` 非数组 → `TypeError`；
+  坐标非有限数 → `TypeError`；v2 归一化点超出 `[0,1]` → `RangeError`。
+  非法数据一律不产生任何副作用（先解析、后回放），调用方视为编程错误。
+
+### 12.4 功能点四：组级连锁揭晓（chainReveal，默认关）
+
+- 开关：`mountScratchCardGroup(entries, { chainReveal: true })`，默认 `false`；
+  每项 `entry.options` 仍可覆盖。只有组构造时使用，单卡 `mountScratchCard` 的行为
+  零变化。
+- 触发源：group 在挂载时包装 `opts.onReveal`。只有**真实揭晓**（threshold/manual）
+  会调 `onReveal`；连锁演示走 `reveal('chain', silent=true)`，静默路径不调
+  `onReveal`——因此连锁不可能回流触发第二次编排（无递归、无重复连锁）。用户的
+  `onReveal` 仍先被原样调用，再编排连锁。
+- 两阶段编排（`scheduleChain`）：
+  1. **同步 arm**：遍历除触发卡外的存活槽位，对每一张此刻 `ready` 且不 busy 的卡调
+     内部原语 `handle._chainArm()`：成功即在卡上置 `chainLocked = true`，
+     **从这一微任务起**该卡的 pointerdown/move/up、键盘（回车/空格/Ctrl+Z）、
+     undo、replaySession 全部被守卫拒绝（`onStrokeEnd` 在锁定期还会把任何悬空半笔
+     直接丢弃，绝不入栈）。已揭晓/busy/销毁的卡 `_chainArm()` 返回 false，不参与、
+     不被锁定。
+  2. **定时 play**：按 100ms 步长排独立 `setTimeout`（100/200/…，上限 300ms，
+     即触发后 300ms 窗口内最多再演示 3 张），到点调 `handle._chainPlay()`：
+     先 `reset()`（清卡、涂层 100% 复原）再 `reveal('chain', true)`（淡出演示，
+     不触发 `onReveal`）。
+- 容错：每个参与卡各自持有一个独立定时器，id 存在槽位上。卡中途 `destroy()`
+  （group 包装过的 destroy）会 `clearTimeout` 自己的定时器；定时器回调内再 try/catch
+  兜底，且 `_chainPlay` 内部经过 reset/reveal 的相位与 destroyed 守卫——任一卡
+  销毁或抛错都不打断其余卡，全程无未捕获异常。
+- 复位语义：`reset()` 会顺手清掉 `chainLocked`，演示卡被运营方复位后可正常再玩；
+  `destroy()` 同样清锁。锁只拒绝「用户输入」语义的入口，不拒绝程序化 reset。
+
+### 12.5 自评：最可能出问题的两个边界（推理，未做浏览器实测）
+
+1. **连锁 arm 与真实揭晓/输入的竞态（同一事件循环微任务内的先后）**。
+   arm 阶段是同步遍历，但遍历到的卡可能恰好在同一 JS 任务稍后的回调里自行揭晓
+   （例如一张卡自己的覆盖率读回在 onReveal 包装函数执行**之前**已 resolve 并排队——
+   实际上同一任务内不会交错，但「用户点击触发卡的 pointerup → requestMeasure 空闲
+   读回 → threshold 揭晓 → 编排连锁」与「邻卡同一时刻也在被刮」跨任务时，邻卡可能
+   在我们遍历前刚进入 revealed）。处理依赖 `_chainArm()` 的相位检查：非 ready 即
+   返回 false、不锁定、不排定时器，跳过它。残余风险是「遍历 arm 完成后、到点
+   play 前」有程序化 API（外部代码直接 `card.reveal()/reset()`)介入：当前设计不锁
+   程序化入口，`_chainPlay` 内的 reset/reveal 相位守卫保证不抛异常、状态机不被破坏
+   （最坏情况是一次多余的复位+演示，且 onReveal 仍只由真实路径触发），评估为可接受。
+2. **极端宽高比/零尺寸附近的归一化往返精度**。v1 升级与 v2 重放都依赖除法/乘法，
+   若录制基准尺寸极小（逻辑宽高理论 >0，CSS 子像素布局可能给到零点几的差值）或目标
+   卡尺寸与录制尺寸相差上百倍，浮点累积可能让本应等于 0/1 的点微微越界。处理：
+   升级与 v2 校验只接受有限数与合法区间，重放映射后统一 clamp 到目标边界，且点→命令
+   推导在 clamp 后的同一套坐标上进行，视觉与 undo 等价性不受影响。真正的零尺寸卡
+   不会 init（沿用既有「等 ResizeObserver 首个非 0 尺寸」逻辑），`exportSession`
+   也会在逻辑尺寸未知时显式抛错，故除零在链路上不可达。
+
+### 12.6 第三方 3 分钟人工验证步骤（不需要读代码）
+
+准备：仓库根目录执行 `npm install`（首次）后 `npm run dev`，浏览器打开终端里提示的
+本地地址（一般是 http://localhost:5173）。页面原有三张灰底「刮一刮」卡片，页面底部
+有一个按钮「重放演示（跨尺寸 + 连锁揭晓）」。建议同时打开浏览器控制台（F12 →
+Console）。
+
+1. **跨尺寸重放（约 1 分钟）**：在页面**第一张**卡片上刮几笔（建议刮掉三四成，别刮
+   到自动揭晓），松开鼠标/手指后点击「重放演示」。页面下方应出现三张尺寸更大的新
+   卡（300×240，与原卡 320×180 宽高比不同），其中**第一张新卡上自动出现的笔迹形状、
+   相对位置应与你在原卡刮的一模一样**（只是整体按新卡尺寸拉伸映射），没有整体偏移
+   或被裁掉。在这张新卡上按 `Ctrl+Z`（Mac 为 `Cmd+Z`），应消失最后一笔，且效果与
+   「当初就少刮这一笔」完全一致；可连续撤销到涂层完整复原。
+2. **导出原子性（约 30 秒）**：先用 Tab 键把焦点移到「重放演示」按钮上（按钮出现
+   聚焦虚框即可），然后回到第一张卡**按住鼠标左键不松手**刮动，刮的过程中按下
+   回车键（触发已聚焦按钮的点击）：应弹出「请先在第 1 张卡上刮几笔（松开鼠标后再
+   点本按钮）」的提示，页面下方不会产生任何新卡——说明按压中的导出被显式拒绝，
+   不会导出半笔；松开鼠标后正常点按钮，重放照常生成。
+3. **连锁揭晓（约 1 分钟）**：对第 1 步新建的那组三张卡，把第一张**刮到约 70% 触发
+   自动揭晓**（或用 Tab 聚焦它后按回车手动揭晓）。预期：第一张正常揭开；随后
+   **第二张、第三张在大约 100ms、200ms 后依次自行「复原满涂层 → 淡出揭晓」**，整个
+   连锁在 300ms 内完成。连锁进行中立刻去刮/按键盘，第二、三张应**完全没有反应**
+   （输入被拒绝）。控制台在整个过程中**只出现一条** `[demo] 真实揭晓 onReveal: …`
+   日志——演示性质的连锁揭晓不会触发回调。
+4. **中途销毁不炸场（约 30 秒）**：再点一次「重放演示」生成一组新卡，刮开第一张
+   触发连锁后，立刻在控制台执行 `__lastDemoGroup.cards[1].destroy()`（销毁即将
+   动作的第二张）：第三张的连锁演示应照常完成，控制台没有红色未捕获异常；
+   `__lastDemoGroup.aliveCount()` 应返回 2。
+
+### 12.7 构建与白名单自检
+
+- `npm run build` 通过；pixi 仍为独立懒加载 chunk（约 878 kB / gzip 251 kB），
+  未新增任何依赖。
+- 交付自检（2026-10-07）：`git status --short` 仅显示 `DESIGN.md`、`src/main.js`、
+  `src/scratch/defaultOptions.js`、`src/scratch/group.js`、
+  `src/scratch/mountScratchCard.js`、`src/scratch/session.js`，白名单外零改动。
