@@ -37,6 +37,7 @@ export function mountScratchCard(el, options = {}) {
     resolution: 1,
     progress: 0,
     busy: false, // context lost / 重建中，忽略输入
+    inputLocked: false, // 组级连锁演示期间置位：拒绝用户输入（DESIGN.md §12.4）
     epoch: 0, // 逻辑世代号：reset 时递增，用于作废进行中的异步读回结果
   }
   const history = createHistory()
@@ -160,7 +161,7 @@ export function mountScratchCard(el, options = {}) {
 
   // ---- 刮擦输入 ----
   function onStrokeStart(x, y) {
-    if (state.phase !== 'ready' || state.busy) return
+    if (state.phase !== 'ready' || state.busy || state.inputLocked) return
     currentStroke = createStroke()
     const cmd = addPoint(currentStroke, clamp(x, 0, state.logicalW), clamp(y, 0, state.logicalH))
     coating.erase([cmd])
@@ -168,7 +169,7 @@ export function mountScratchCard(el, options = {}) {
   }
 
   function onStrokeMove(x, y) {
-    if (!currentStroke || state.phase !== 'ready' || state.busy) return
+    if (!currentStroke || state.phase !== 'ready' || state.busy || state.inputLocked) return
     // 卡外坐标 clamp 到边界：沿边滑动不断线，且不结束笔画（DESIGN.md §4.5）
     const cmd = addPoint(currentStroke, clamp(x, 0, state.logicalW), clamp(y, 0, state.logicalH))
     coating.erase([cmd])
@@ -236,7 +237,7 @@ export function mountScratchCard(el, options = {}) {
 
   // ---- 撤销 ----
   function undo() {
-    if (state.phase !== 'ready' || state.busy || destroyed) return false
+    if (state.phase !== 'ready' || state.busy || state.inputLocked || destroyed) return false
     const s = popStroke(history)
     if (!s) return false
     replayAll() // 清 RT 重放剩余笔画；撤到空栈 = 涂层 100% 复原，不触发揭晓
@@ -302,8 +303,10 @@ export function mountScratchCard(el, options = {}) {
 
   function replaySession(data) {
     if (state.phase !== 'ready' || state.busy || destroyed) return false
-    const session = parseSession(data) // 非法数据抛错（编程错误，显式失败）
-    for (const stroke of buildStrokes(session)) {
+    const session = parseSession(data) // v1 无损升级 v2；非法数据抛错（编程错误，显式失败）
+    // 归一化坐标 → 本卡逻辑尺寸：唯一的仿射映射点（DESIGN.md §12.1），
+    // 跨尺寸重放在此完成；入栈后即逻辑坐标，resize 映射不会与之叠加
+    for (const stroke of buildStrokes(session, state.logicalW, state.logicalH)) {
       pushStroke(history, stroke)
       // 与实时刮擦共用同一套点→命令推导，逐笔增量擦除：
       // 之后 undo 弹栈重放剩余笔画，与「少一笔数据直接回放」逐命令一致
@@ -422,6 +425,13 @@ export function mountScratchCard(el, options = {}) {
     exportSession,
     replaySession,
     getProgress: () => state.progress,
+    /** 组级协作 API（DESIGN.md §12.4）：连锁演示期间拒绝用户输入；非业务 API */
+    lock: () => {
+      state.inputLocked = true
+    },
+    unlock: () => {
+      state.inputLocked = false
+    },
     resize: (w, h) => {
       if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {
         opts.width = w

@@ -71,6 +71,20 @@ for (let i = 0; i < 3; i++) {
 }
 const scratchGroup = mountScratchCardGroup(scratchHosts)
 
+// 重放演示：把第 1 张卡的会话导出，跨卡重放到第 2 张（演示 exportSession/replaySession）
+const replayBtn = document.createElement('button')
+replayBtn.type = 'button'
+replayBtn.textContent = '重放演示（卡1 → 卡2）'
+replayBtn.style.cssText = 'display:block;margin:0 auto 24px;'
+replayBtn.addEventListener('click', () => {
+  const [cardA, cardB] = scratchGroup.cards
+  if (!cardA || !cardB) return
+  const session = cardA.exportSession()
+  cardB.reset() // 若已揭晓先复位；非 revealed 时返回 false 无副作用
+  cardB.replaySession(session)
+})
+document.querySelector('#app').appendChild(replayBtn)
+
 if (import.meta.hot) {
   import.meta.hot.dispose(() => scratchGroup.destroy())
 }
